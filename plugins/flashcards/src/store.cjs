@@ -2,14 +2,19 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { valid } = require('./merge.cjs');
 
+const stamp = stat => `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
 function atomicWrite(file, content) {
   const temporary = `${file}.${randomUUID()}.tmp`;
   let fd;
   try {
     fd = fs.openSync(temporary, 'wx', 0o600);
-    fs.writeFileSync(fd, content); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
+    fs.writeFileSync(fd, content); fs.fsyncSync(fd);
+    const written = fs.fstatSync(fd); // rename keeps inode, size and mtime
+    fs.closeSync(fd); fd = undefined;
     fs.renameSync(temporary, file);
+    return stamp(written);
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
     try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -54,36 +59,50 @@ const defaults = () => ({ retention: 0.9, learningSteps: [1, 10], relearningStep
 function openStore(directory) {
   fs.mkdirSync(directory, { recursive: true });
   const file = path.join(directory, 'flashcards.json');
-  let state;
-  try { state = JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch (error) {
-    if (error.code !== 'ENOENT') throw new Error(`Could not read Flashcards data: ${error.message}`);
-    state = { version: 1, revision: 0, settings: { ...defaults(), autoSince: Date.now() }, decks: [], propositions: {}, reviews: [], batches: [] };
+  let state, seen = null;
+  function load(initial) {
+    let next;
+    try { const before = stamp(fs.statSync(file)); next = JSON.parse(fs.readFileSync(file, 'utf8')); seen = before; }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw new Error(`Could not read Flashcards data: ${error.message}`);
+      if (!initial) return; // Briefly missing (e.g. mid git checkout): keep the current state.
+      next = { version: 1, revision: 0, settings: { ...defaults(), autoSince: Date.now() }, decks: [], propositions: {}, reviews: [], batches: [] };
+    }
+    if (!valid(next)) throw new Error('Unsupported or invalid Flashcards data. No data was changed.');
+    const migrated = structuredClone(next);
+    if (migrate(migrated)) {
+      migrated.revision++;
+      seen = atomicWrite(file, JSON.stringify(migrated));
+      next = migrated;
+    }
+    state = next;
   }
-  if (state.version !== 1 || !Number.isSafeInteger(state.revision) || !Array.isArray(state.decks) || !Array.isArray(state.reviews) || !Array.isArray(state.batches) || !state.propositions || !state.settings) throw new Error('Unsupported or invalid Flashcards data. No data was changed.');
-  const migrated = structuredClone(state);
-  if (migrate(migrated)) {
-    migrated.revision++;
-    atomicWrite(file, JSON.stringify(migrated));
-    state = migrated;
-  }
+  load(true);
+  // Another writer (a git pull bringing the phone's reviews) may replace the
+  // file; reload it before use so local writes never overwrite those changes.
+  const current = () => {
+    let now;
+    try { now = stamp(fs.statSync(file)); } catch (error) { if (error.code !== 'ENOENT') throw error; return state; }
+    if (now !== seen) load(false);
+    return state;
+  };
   const sourceFile = id => {
     if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Invalid file source ID.');
     return path.join(directory, 'sources', `${id}.md`);
   };
   return {
-    get: () => state,
+    get: current,
     writeSource(id, markdown) { const file = sourceFile(id); fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); atomicWrite(file, markdown); },
     readSource(id) { return fs.readFileSync(sourceFile(id), 'utf8'); },
     removeSource(id) { try { fs.unlinkSync(sourceFile(id)); } catch (error) { if (error.code !== 'ENOENT') throw error; } },
     change(update) {
-      const next = structuredClone(state);
+      const next = structuredClone(current());
       const result = update(next);
       next.revision++;
-      atomicWrite(file, JSON.stringify(next));
+      seen = atomicWrite(file, JSON.stringify(next));
       state = next;
       return result;
     },
   };
 }
-module.exports = { openStore, defaults };
+module.exports = { openStore, defaults, valid };

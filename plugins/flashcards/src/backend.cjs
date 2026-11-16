@@ -17,7 +17,8 @@ const resultSchema = {
 const estimate = (input) => Math.ceil(Buffer.byteLength(instructions + JSON.stringify(resultSchema) + promptFor(input), 'utf8') / 3) + 256;
 const fingerprint = (input) => createHash('sha256').update(JSON.stringify(input)).digest('hex');
 const activeBatch = (s) => s.batches.findLast(b => ['running', 'cancelling'].includes(b.status));
-const memberships = (s, id) => s.decks.filter(d => d.propositionIds.includes(id)).map(d => d.id);
+const queue = require('./review-queue.cjs');
+const { memberships, counts, scopeIds, reviewCues } = queue;
 const isLocal = p => p.origin === 'file' || p.origin === 'manual';
 const reviewConfiguration = s => fingerprint({ retention: s.retention, learningSteps: s.learningSteps, relearningSteps: s.relearningSteps, dayStart: s.dayStart, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone });
 const fail = (message) => { throw new Error(message); };
@@ -133,12 +134,6 @@ function activate(ctx) {
   const deck = (s, id) => s.decks.find(d => d.id === id) ?? fail('Deck not found.');
   const fileSource = (s, id) => Object.hasOwn(s.fileSources ?? {}, id) ? s.fileSources[id] : fail('File source not found.');
   function liveIds(s) { return new Set([...graphNow().propositions.map(p => p.id), ...Object.values(s.propositions).filter(isLocal).map(p => p.id)]); }
-  function counts(s, now) {
-    const { start, end } = scheduler.dayBounds(now, s.settings.dayStart);
-    const result = Object.fromEntries(s.decks.map(d => [d.id, 0]));
-    for (const review of s.reviews) if (review.introduced && review.at >= start && review.at < end) for (const id of review.deckIds) if (id in result) result[id]++;
-    return result;
-  }
   function view() {
     alive(); const s = store.get(), live = liveIds(s), now = Date.now();
     const newCounts = counts(s, now);
@@ -533,23 +528,6 @@ function activate(ctx) {
   });
   register('resume-results', () => { reconcile(); return view(); });
 
-  function scopeIds(s, scope) {
-    if (scope.deckIds !== undefined && (!Array.isArray(scope.deckIds) || scope.deckIds.some(id => !s.decks.some(d => d.id === id)))) fail('Selected deck no longer exists.');
-    if (scope.propositionIds !== undefined && !Array.isArray(scope.propositionIds)) fail('Invalid review selection.');
-    if (scope.cueIds !== undefined && (!Array.isArray(scope.cueIds) || scope.cueIds.some(id => typeof id !== 'string'))) fail('Invalid cue selection: use an array of cue IDs.');
-    const ds = scope.deckIds ? s.decks.filter(d => scope.deckIds.includes(d.id)) : s.decks;
-    let ids = [...new Set(ds.flatMap(d => d.propositionIds))];
-    if (scope.propositionIds) ids = ids.filter(id => scope.propositionIds.includes(id));
-    return { decks: ds, ids };
-  }
-  function reviewCues(p, scope) {
-    const active = p.cues.filter(c => !c.deleted);
-    if (scope.cueIds === undefined) return active;
-    const pinned = [1, 3].includes(p.schedule.state) && active.find(c => c.id === p.learningCueId);
-    // Do not switch away from an active learning cue just because it is unselected.
-    if (pinned && !scope.cueIds.includes(pinned.id)) return [];
-    return active.filter(c => scope.cueIds.includes(c.id));
-  }
   function validTicket(id, mustReveal = false, now = Date.now()) {
     const t = tickets.get(id) ?? fail('This review expired. Load the next card.');
     const s = store.get(), p = prop(s, t.propositionId);
@@ -564,35 +542,9 @@ function activate(ctx) {
     return { t, p, c, s };
   }
   register('next-review', scope => {
-    const s = store.get(), live = liveIds(s), now = Date.now();
-    const selection = scopeIds(s, scope), used = counts(s, now);
-    const candidates = selection.ids.map(id => s.propositions[id]).filter(p => p && live.has(p.id) && reviewCues(p, scope).length);
-    const ready = candidates.filter(p => p.schedule.state !== 0 && scheduler.isDue(p.schedule, now, s.settings.dayStart));
-    ready.sort((a, b) => ((a.schedule.state === 1 || a.schedule.state === 3) ? 0 : 1) - ((b.schedule.state === 1 || b.schedule.state === 3) ? 0 : 1) || a.schedule.due - b.schedule.due);
-    let p = ready[0], admittingDeckId = null;
-    if (!p) {
-      for (const d of selection.decks) {
-        if (used[d.id] >= d.newLimit) continue;
-        p = candidates.find(p => p.schedule.state === 0 && d.propositionIds.includes(p.id));
-        if (p) { admittingDeckId = d.id; break; }
-      }
-    }
-    if (!p) {
-      const future = candidates.filter(p => [1, 3].includes(p.schedule.state) && p.schedule.due > now).map(p => p.schedule.due);
-      return { ticket: null, ...(future.length ? { nextDue: Math.min(...future) } : {}), remaining: 0 };
-    }
-    // Count introductions in the same deterministic admission order without
-    // consuming allowances, changing schedules, or making additional cue choices.
-    let remaining = ready.length;
-    const simulated = { ...used }, introduced = new Set();
-    for (const d of selection.decks) for (const candidate of candidates) {
-      if (simulated[d.id] >= d.newLimit) break;
-      if (candidate.schedule.state !== 0 || introduced.has(candidate.id) || !d.propositionIds.includes(candidate.id)) continue;
-      introduced.add(candidate.id); remaining++;
-      for (const id of memberships(s, candidate.id)) simulated[id]++;
-    }
-    const active = reviewCues(p, scope);
-    const chosen = ([1, 3].includes(p.schedule.state) && active.find(c => c.id === p.learningCueId)) || scheduler.chooseCue(active);
+    const s = store.get(), now = Date.now();
+    const { proposition: p, cue: chosen, admittingDeckId, remaining, nextDue } = queue.nextReview(s, scope, now, liveIds(s));
+    if (!p) return { ticket: null, ...(nextDue !== undefined ? { nextDue } : {}), remaining };
     const id = randomUUID();
     tickets.set(id, { id, propositionId: p.id, cueId: chosen.id, version: p.version, settingsHash: reviewConfiguration(s.settings), day: scheduler.studyDay(now, s.settings.dayStart), scope: structuredClone(scope), admittingDeckId, revealed: false });
     return { ticket: { id, propositionId: p.id, cueId: chosen.id, question: chosen.question, propositionName: p.name }, remaining };
@@ -610,12 +562,8 @@ function activate(ctx) {
     if (![1, 2, 3, 4].includes(rating)) fail('Invalid rating.');
     const now = Date.now(), { t } = validTicket(ticketId, true, now);
     change(s => {
-      const p = prop(s, t.propositionId), c = p.cues.find(c => c.id === t.cueId);
-      const before = p.schedule, introduced = p.firstReviewedAt == null;
-      p.schedule = scheduler.rate(before, rating, now, s.settings);
-      p.learningCueId = [1, 3].includes(p.schedule.state) ? c.id : null;
-      p.firstReviewedAt ??= now; c.latestRating = rating; c.lastReviewedAt = now; p.version++;
-      s.reviews.push({ id: randomUUID(), requestId, ticketId, propositionId: p.id, cueId: c.id, rating, at: now, before, after: p.schedule, introduced, deckIds: introduced ? memberships(s, p.id) : [], settings: structuredClone(s.settings) });
+      const p = prop(s, t.propositionId);
+      queue.applyRating(s, p, p.cues.find(c => c.id === t.cueId), rating, now, { requestId, ticketId });
     });
     tickets.delete(ticketId); return { ok: true };
   });

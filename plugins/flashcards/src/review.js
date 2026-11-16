@@ -17,7 +17,7 @@ const el = (tag, className, text) => {
   if (text !== undefined) node.textContent = text;
   return node;
 };
-const interval = ms => {
+export const interval = ms => {
   if (ms < 60000) return `${Math.max(1, Math.round(ms / 1000))}s`;
   if (ms < 3600000) return `${Math.round(ms / 60000)}m`;
   if (ms < 86400000) return `${Math.round(ms / 3600000)}h`;

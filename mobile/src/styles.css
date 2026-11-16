@@ -1,0 +1,47 @@
+@import "tailwindcss";
+@source "./";
+@source "../../node_modules/streamdown/dist/*.js";
+@source "../../node_modules/@streamdown/*/dist/*.js";
+
+/* The Mac app's Default (dark) and Ivory (light) palettes, following the system. */
+:root {
+	color-scheme: light;
+	--background: #faf9f5; --foreground: #3d3d3a; --card: #f0eee6; --muted: #f0eee6;
+	--muted-foreground: #83827d; --border: #e0ddd2; --primary: #3d3d3a; --primary-foreground: #faf9f5;
+	--destructive: #c43d3d;
+	/* Rating colors: the Mac plugin's, in both themes. */
+	--fc-red: #f87171; --fc-amber: #fbbf24; --fc-green: #4ade80; --fc-blue: #60a5fa;
+}
+@media (prefers-color-scheme: dark) {
+	:root {
+		color-scheme: dark;
+		--background: #141414; --foreground: #e6e6e6; --card: #1c1c1c; --muted: #1c1c1c;
+		--muted-foreground: #8d8d8d; --border: #434343; --primary: #e6e6e6; --primary-foreground: #141414;
+		--destructive: #ef4444;
+	}
+}
+@theme inline {
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-border: var(--border);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-destructive: var(--destructive);
+	--color-sidebar: var(--card);
+}
+
+html, body { background: var(--background); color: var(--foreground); }
+body {
+	margin: 0;
+	font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+	padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+	-webkit-text-size-adjust: 100%;
+}
+.card-markdown { font-size: 17px; overflow-wrap: anywhere; min-width: 0; }
+.card-markdown > :first-child { margin-top: 0; }
+.card-markdown > :last-child { margin-bottom: 0; }
+.card-markdown table { margin-inline: auto; }
+[data-streamdown="mermaid"] svg { max-width: 100% !important; height: auto !important; }

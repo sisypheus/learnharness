@@ -1,0 +1,9 @@
+{
+  "name": "LearnHarness Flashcards",
+  "short_name": "Flashcards",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#141414",
+  "icons": [{ "src": "icon.png", "sizes": "512x512", "type": "image/png" }]
+}

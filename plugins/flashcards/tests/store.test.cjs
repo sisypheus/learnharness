@@ -73,11 +73,11 @@ test('legacy cleanup is atomic, retains live manual cues and text-free receipts,
     ] };
     s.reviews.push({ id: 'r', propositionId: 'p', cueId: 'gone', question: 'OLD REVIEW QUESTION', answer: 'OLD REVIEW ANSWER', rating: 3, at: 123 });
   });
-  const bytes = fs.readFileSync(file, 'utf8'), rename = t.mock.method(fs, 'renameSync', () => { throw new Error('Migration save unavailable'); });
+  const revision = original.get().revision, bytes = fs.readFileSync(file, 'utf8'), rename = t.mock.method(fs, 'renameSync', () => { throw new Error('Migration save unavailable'); });
   try { assert.throws(() => openStore(dir), /Migration save unavailable/); }
   finally { rename.mock.restore(); }
   assert.equal(fs.readFileSync(file, 'utf8'), bytes); assert.deepEqual(fs.readdirSync(dir), ['flashcards.json']);
-  const migrated = openStore(dir).get(); assert.equal(migrated.revision, original.get().revision + 1);
+  const migrated = openStore(dir).get(); assert.equal(migrated.revision, revision + 1);
   assert.deepEqual(migrated.propositions.p.cues, [{ id: 'kept', question: 'Kept question', answer: 'Kept answer' }]);
   assert.equal(migrated.propositions.p.learningCueId, null); assert.equal(migrated.propositions.p.version, 2);
   assert.deepEqual(migrated.reviews, [{ id: 'r', propositionId: 'p', cueId: 'gone', rating: 3, at: 123 }]);
@@ -93,4 +93,19 @@ test('malformed and unsupported stores fail closed without overwriting original 
     assert.equal(fs.readFileSync(file, 'utf8'), bytes);
     assert.deepEqual(fs.readdirSync(dir), ['flashcards.json']);
   }
+});
+
+test('an external replacement of the file (a git pull) is reloaded before reads and writes', t => {
+  const dir = directory(t), file = path.join(dir, 'flashcards.json'), store = openStore(dir);
+  store.change(s => s.decks.push({ id: 'mac', name: 'Mac', propositionIds: [], newLimit: 20 }));
+  const pulled = structuredClone(store.get());
+  pulled.decks.push({ id: 'phone', name: 'Phone', propositionIds: [], newLimit: 20 }); pulled.revision++;
+  fs.writeFileSync(`${file}.pull`, JSON.stringify(pulled)); fs.renameSync(`${file}.pull`, file);
+  assert.deepEqual(store.get().decks.map(d => d.id), ['mac', 'phone']);
+  store.change(s => s.decks.push({ id: 'after', name: 'After', propositionIds: [], newLimit: 20 }));
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).decks.map(d => d.id), ['mac', 'phone', 'after']);
+  // An invalid replacement (e.g. conflict markers) is refused, never overwritten.
+  fs.writeFileSync(file, '<<<<<<< ours');
+  assert.throws(() => store.change(s => s.decks.pop()), /Could not read Flashcards data/);
+  assert.equal(fs.readFileSync(file, 'utf8'), '<<<<<<< ours');
 });
