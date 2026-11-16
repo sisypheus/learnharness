@@ -10,7 +10,7 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 
-async function setup({ delayedMount = false } = {}) {
+async function setup({ delayedMount = false, onDelete } = {}) {
   const { document, window } = parseHTML('<html><body></body></html>');
   global.document = document;
   if (!global.crypto) global.crypto = webcrypto;
@@ -85,7 +85,7 @@ async function setup({ delayedMount = false } = {}) {
       return item;
     },
     markdown(parent, text, signal) { markdowns.push(text); return handle('markdown', parent, text, signal); },
-    onRated() { refreshed++; },
+    onRated() { refreshed++; }, onDelete, deleteIcon: '<svg></svg>',
   });
   return {
     document, window, controller, calls, surfaces, handles, markdowns, overrides, view, plugin,
@@ -860,5 +860,45 @@ test('practice preserves currently owned focus without stealing focus from Setti
     h.click('Next'); assert.equal(h.document.activeElement, settings);
     assert.equal(h.title, title);
     assert.deepEqual(h.calls, []);
+  } finally { h.dispose(); }
+});
+
+test('review delete removes the shown cue instantly and loads the next card', async () => {
+  const deleted = [];
+  const h = await setup({ onDelete: async cueId => { deleted.push(cueId); } });
+  try {
+    let n = 0;
+    h.overrides['next-review'] = () => ({ ticket: { id: `t${++n}`, cueId: `c${n}`, propositionName: 'Fact', question: `Q${n}` }, remaining: 1 });
+    h.controller.open({}); await flush();
+    assert.equal(h.bottom.querySelector('button').textContent, 'Delete card', 'available before reveal');
+    h.click('Delete card'); await flush(); await flush();
+    assert.deepEqual(deleted, ['c1']);
+    assert.equal(h.calls.filter(([op]) => op === 'next-review').length, 2);
+    assert.equal(h.calls.some(([op]) => op === 'rate-review'), false, 'deletion is not a rating');
+    h.click('Reveal answer'); await flush();
+    assert.ok(h.bottom.querySelector('button'), 'still available after reveal');
+  } finally { h.dispose(); }
+});
+
+test('review delete failure keeps the card and shows the error', async () => {
+  const h = await setup({ onDelete: async () => { throw new Error('Wait for generation to finish'); } });
+  try {
+    h.controller.open({}); await flush();
+    h.click('Delete card'); await flush();
+    assert.equal(h.footer.querySelector('.fc-error').textContent, 'Wait for generation to finish');
+    assert.equal(h.calls.filter(([op]) => op === 'next-review').length, 1);
+    h.click('Delete card');
+  } finally { h.dispose(); }
+});
+
+test('practice delete removes the cue and advances without changing the schedule', async () => {
+  const deleted = [];
+  const h = await setup({ onDelete: async cueId => { deleted.push(cueId); } });
+  try {
+    h.controller.openPractice(practiceCards()); await flush();
+    h.click('Delete card'); await flush();
+    assert.deepEqual(deleted, ['c1']);
+    assert.ok(h.card.textContent.includes('PRACTICE Q2'));
+    assert.equal(h.calls.length, 0, 'practice makes no review calls');
   } finally { h.dispose(); }
 });

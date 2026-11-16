@@ -38,7 +38,7 @@ function lifetime(...parents) {
   return controller;
 }
 
-export function createReviewController({ ctx, signal, button, markdown, onRated }) {
+export function createReviewController({ ctx, signal, button, markdown, onRated, onDelete, deleteIcon }) {
   const owner = lifetime(signal, ctx.signal);
   let active = null;
   const dispose = () => { owner.abort(); active?.close(); };
@@ -106,6 +106,17 @@ export function createReviewController({ ctx, signal, button, markdown, onRated 
         if (count !== undefined) bottom.append(el("p", "fc-review-remaining", count));
         return { answer, actions, error };
       }
+      // Quiet trash icon, no shortcut: deletes this cue permanently, then moves on.
+      function deletion(cueId, cs, error, after) {
+        if (!onDelete) return;
+        let busy = false;
+        const handle = button(bottom, "Delete card", async () => {
+          if (busy || cs.aborted) return;
+          busy = true; handle.update({ disabled: true });
+          try { await onDelete(cueId); if (!cs.aborted) { focusOwned(); after(); } }
+          catch (cause) { if (!cs.aborted) { error.textContent = message(cause); busy = false; handle.update({ disabled: false }); } }
+        }, cs, { icon: deleteIcon, iconOnly: true, size: "icon-sm", variant: "ghost", title: "Delete card" });
+      }
       function control(parent, label, action, cs, hint, options = {}) {
         const wrapper = el("div", "fc-rating"); parent.append(wrapper);
         const handle = button(wrapper, label, action, cs, options);
@@ -119,7 +130,8 @@ export function createReviewController({ ctx, signal, button, markdown, onRated 
         const cs = reset(), index = practiceIndex, cue = practiceCards[index];
         if (!cue) { footer.append(el("p", "fc-review-meta", "Practice complete.")); return; }
         const remaining = practiceCards.length - index - 1;
-        const { answer, actions } = question(cue, cs, `${remaining} ${remaining === 1 ? 'card' : 'cards'} remaining`);
+        const { answer, actions, error } = question(cue, cs, `${remaining} ${remaining === 1 ? 'card' : 'cards'} remaining`);
+        deletion(cue.cueId, cs, error, () => { if (index === practiceIndex) { practiceIndex++; nextPractice(); } });
         let revealButton;
         revealAction = () => {
           if (revealed || cs.aborted || index !== practiceIndex) return;
@@ -158,6 +170,7 @@ export function createReviewController({ ctx, signal, button, markdown, onRated 
           }
           const ticket = result.ticket;
           const { answer, actions, error } = question(ticket, cs, result.remaining === undefined ? undefined : `${result.remaining} ready`);
+          deletion(ticket.cueId, cs, error, () => { void nextReview(); });
           let revealButton, retryButton, revealBusy = false, ratingBusy = false;
           const requests = new Map();
           const failed = cause => {

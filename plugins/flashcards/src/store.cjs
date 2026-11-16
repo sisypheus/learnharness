@@ -46,9 +46,11 @@ function migrate(state) {
   }
   // Ratings/timing/schedule snapshots suffice for statistics and retry receipts.
   for (const r of state.reviews) for (const key of ['question', 'answer']) if (Object.hasOwn(r, key)) { delete r[key]; changed = true; }
+  // Auto-generation starts from the upgrade moment; older propositions wait for backfill.
+  if (state.settings.autoSince === undefined) { state.settings.autoGenerate ??= true; state.settings.autoSince = Date.now(); changed = true; }
   return changed;
 }
-const defaults = () => ({ retention: 0.9, learningSteps: [1, 10], relearningSteps: [10], dayStart: 4, fuzz: false, chunkBudget: 4000, modelOverride: null });
+const defaults = () => ({ retention: 0.9, learningSteps: [1, 10], relearningSteps: [10], dayStart: 4, fuzz: false, chunkBudget: 4000, modelOverride: null, autoGenerate: true });
 function openStore(directory) {
   fs.mkdirSync(directory, { recursive: true });
   const file = path.join(directory, 'flashcards.json');
@@ -56,7 +58,7 @@ function openStore(directory) {
   try { state = JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch (error) {
     if (error.code !== 'ENOENT') throw new Error(`Could not read Flashcards data: ${error.message}`);
-    state = { version: 1, revision: 0, settings: defaults(), decks: [], propositions: {}, reviews: [], batches: [] };
+    state = { version: 1, revision: 0, settings: { ...defaults(), autoSince: Date.now() }, decks: [], propositions: {}, reviews: [], batches: [] };
   }
   if (state.version !== 1 || !Number.isSafeInteger(state.revision) || !Array.isArray(state.decks) || !Array.isArray(state.reviews) || !Array.isArray(state.batches) || !state.propositions || !state.settings) throw new Error('Unsupported or invalid Flashcards data. No data was changed.');
   const migrated = structuredClone(state);

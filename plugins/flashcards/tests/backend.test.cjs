@@ -82,13 +82,14 @@ function harness(t, initialGraph = graph('p1')) {
     models: [{ provider: 'mock', id: 'cheap', name: 'Mock cheap', supportedLevels: ['off', 'low'], contextWindow: 100000, maxTokens: 8192 }],
   } };
   let handlers, controller, cleanups = [];
+  h.listeners = new Set();
   h.dispose = () => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); controller?.abort(); };
   h.activate = () => {
     h.dispose(); handlers = new Map(); controller = new AbortController();
     activate({ dataDirectory: directory, signal: controller.signal,
       workers: workers.service, learning: { graph: () => structuredClone(h.graph) },
       inference: { catalog: async () => { h.catalogReads++; return h.resolveCatalog ? h.resolveCatalog() : structuredClone(h.catalog); } },
-      events: { emit() {} }, handle: (name, handler) => handlers.set(name, handler),
+      events: { emit() {}, on: listener => { h.listeners.add(listener); return () => h.listeners.delete(listener); } }, handle: (name, handler) => handlers.set(name, handler),
       cleanup: fn => { assert.equal(typeof fn, 'function'); cleanups.push(fn); },
     });
   };
@@ -1197,4 +1198,98 @@ test('settings validate atomically and model resolution fails explicitly without
   await assert.rejects(h.call('preflight', { propositionIds: ['p1'] }), /Configure the cheap model slot/);
   assert.equal(h.workers.starts, 0);
   assert.deepEqual(h.state().propositions, []);
+});
+
+// Auto-generation: propositions newer than autoSince from teaching chats.
+const fresh = (id, source = 'source') => ({ ...node(id, source), createdAt: new Date(Date.now() + 60000).toISOString() });
+async function autoHarness(t, initialGraph) {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = harness(t, initialGraph);
+  h.auto = async () => {
+    for (const listener of h.listeners) listener({ type: 'activity-changed' });
+    t.mock.timers.tick(2000);
+    for (let i = 0; i < 10; i++) await flush();
+  };
+  return h;
+}
+
+test('auto-generation queues new teaching-chat propositions once', async t => {
+  const h = await autoHarness(t, { ...graph('old'), propositions: [node('old'), fresh('p2')] });
+  await h.auto();
+  assert.equal(h.workers.starts, 1);
+  const batch = h.disk().batches.at(-1);
+  assert.equal(batch.origin, 'auto');
+  assert.deepEqual(batch.chunks.flatMap(c => c.targetIds), ['p2']);
+  await h.auto();
+  assert.equal(h.workers.starts, 1, 'an in-flight proposition is not queued twice');
+});
+
+test('auto-generation ignores imported-notes propositions', async t => {
+  const h = await autoHarness(t, { propositions: [fresh('n1', 'src_notes')], chains: [], sessions: { source: 'Lesson' }, fileSources: { src_notes: '/notes.md' } });
+  await h.auto();
+  assert.equal(h.workers.starts, 0);
+  assert.deepEqual(await h.call('preflight-backfill'), { propositionCount: 0 });
+});
+
+test('older propositions wait for backfill, and handled ones are never re-attempted', async t => {
+  const h = await autoHarness(t, { ...graph('old'), propositions: [node('old'), fresh('p2')] });
+  await h.auto();
+  const [task] = h.workers.service.list();
+  await h.complete(task, result(cards('p2')));
+  assert.equal(h.state().propositions.length, 0, 'zero cards leaves no record');
+  await h.auto();
+  assert.equal(h.workers.starts, 1, 'zero-card proposition is not retried');
+  const backfill = await h.call('preflight-backfill');
+  assert.equal(backfill.propositionCount, 1);
+  await h.call('start-generation', { preflightId: backfill.id, requestId: randomUUID() }); await flush();
+  assert.deepEqual(h.disk().batches.at(-1).chunks.flatMap(c => c.targetIds), ['old']);
+});
+
+test('auto-generation respects the setting and re-enabling moves autoSince forward', async t => {
+  const h = await autoHarness(t, { ...graph(), propositions: [fresh('p2')] });
+  const since = h.state().settings.autoSince;
+  await h.call('save-settings', { autoGenerate: false });
+  await h.auto();
+  assert.equal(h.workers.starts, 0);
+  await new Promise(resolve => setImmediate(resolve));
+  const before = Date.now();
+  await h.call('save-settings', { autoGenerate: true });
+  assert.ok(h.disk().settings.autoSince >= Math.max(since, before));
+  await assert.rejects(h.call('save-settings', { autoGenerate: 'yes' }), /Auto-generation must be on or off/);
+});
+
+test('auto-generation waits for an active batch and runs after it finishes', async t => {
+  const h = await autoHarness(t, { ...graph('p1'), propositions: [node('p1'), fresh('p2')] });
+  const [manual] = await h.start(['p1']);
+  await h.auto();
+  assert.equal(h.workers.starts, 1, 'blocked by the manual batch');
+  await h.complete(manual, result(cards('p1', 'Manual')));
+  t.mock.timers.tick(2000);
+  for (let i = 0; i < 10; i++) await flush();
+  assert.equal(h.workers.starts, 2);
+  assert.deepEqual(h.disk().batches.at(-1).chunks.flatMap(c => c.targetIds), ['p2']);
+});
+
+test('migration seeds auto settings on an older store', t => {
+  const { openStore } = require('../src/store.cjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'flashcards-migrate-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { autoGenerate, ...oldSettings } = defaults();
+  fs.writeFileSync(path.join(dir, 'flashcards.json'), JSON.stringify({ version: 1, revision: 3, settings: oldSettings, decks: [], propositions: {}, reviews: [],
+    batches: [{ id: 'b', kind: 'graph', chunks: [{ targetIds: ['a', 'b'] }, { targetIds: ['b'] }] }, { id: 'f', kind: 'file', chunks: [{ start: 0, end: 1 }] }] }));
+  const state = openStore(dir).get();
+  assert.equal(state.settings.autoGenerate, true);
+  assert.equal(typeof state.settings.autoSince, 'number');
+  assert.equal(state.revision, 4);
+});
+
+test('failed chunks are not auto-retried but stay available to backfill', async t => {
+  const h = await autoHarness(t, { ...graph(), propositions: [fresh('p2')] });
+  await h.auto();
+  const [task] = h.workers.service.list();
+  await h.complete(task, null, 'failed');
+  await h.auto();
+  assert.equal(h.workers.starts, 1, 'auto does not loop on a failing model');
+  const backfill = await h.call('preflight-backfill');
+  assert.equal(backfill.propositionCount, 1);
 });

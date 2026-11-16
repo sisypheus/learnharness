@@ -66,7 +66,7 @@ Being an official plugin does not make its dependencies application-wide. Third-
 
 ## Generation is explicit, contextual, and additive
 
-The learner decides what enters the flashcard system. Version one has no automatic generation when a teaching session finishes or graph content appears.
+The learner decides what enters the flashcard system. **Superseded (human decision, 2026-11-11):** generation may now also run automatically. When graph extraction adds propositions born in a teaching chat (not imported notes), the plugin queues them for generation. This is a plugin setting, on by default, and covers only propositions created after the setting was last enabled. A confirmed one-click backfill covers older teaching-chat propositions. A proposition whose generation succeeded once is never auto-processed or backfilled again; manual selection still can. Failed attempts are not auto-retried, but backfill offers them again.
 
 Proposition/reasoning-chain selection reuses the **actual host chains view**, rather than a new picker implementation inside Flashcards. The interaction should mirror the new-practice selection bubble: open the full-view selector, select knowledge, then close it while retaining the selection in the plugin's workflow. It need not be embedded among other plugin controls or inherit the graph canvas's current selection.
 

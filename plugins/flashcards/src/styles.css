@@ -79,7 +79,7 @@
 .fc-root .fc-rating { display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .fc-root .fc-shortcut { color: var(--muted-foreground, #888); font-size: 11px; }
 .fc-root .fc-review-meta, .fc-root .fc-review-remaining { color: var(--muted-foreground, #888); font-size: 12px; }
-.fc-root .fc-review-bottom { display: flex; align-items: flex-start; justify-content: flex-end; margin-top: 8px; text-align: right; }
+.fc-root .fc-review-bottom { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 8px; text-align: right; }
 .fc-root .fc-review-bottom:empty { display: none; }
 .fc-root .fc-review-bottom > p { margin: 0; }
 .fc-root .fc-review-bottom .fc-review-remaining { margin-left: auto; text-align: right; white-space: nowrap; }

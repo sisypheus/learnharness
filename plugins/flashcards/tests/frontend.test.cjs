@@ -237,7 +237,7 @@ test('deck panel groups search, Create deck, selection and tree separately from 
   try {
     const toolbar = h.app.querySelector('.fc-toolbar'), panel = h.app.querySelector('section.fc-deck-panel');
     assert.ok(panel);
-    assert.deepEqual([...toolbar.querySelectorAll('button')].map(button => button.textContent).sort(), ['Pick nodes', 'Generate', fileButtonLabel].sort());
+    assert.deepEqual([...toolbar.querySelectorAll('button')].map(button => button.textContent).sort(), ['Pick nodes', 'Generate', 'Generate for all untaught…', fileButtonLabel].sort());
     assert.equal(toolbar.querySelector('input[type=search]'), null);
     const deckToolbar = panel.querySelector('.fc-deck-toolbar'); assert.ok(deckToolbar);
     assert.equal(deckToolbar.querySelector('input[type=search]'), h.app.querySelector('input[type=search]'));
@@ -1343,3 +1343,20 @@ if (process.env.FLASHCARDS_BROWSER_FIXTURE) {
   const html = '<!doctype html><html><head><meta charset="utf-8"><style>' + fs.readFileSync(path.join(__dirname, '../src/styles.css'), 'utf8') + '</style></head><body><script type="module">' + source + '\nwindow.h = (' + fixture.toString() + ')(document); activate(window.h.ctx); window.h.mount();</script></body></html>';
   fs.writeFileSync(process.env.FLASHCARDS_BROWSER_FIXTURE, html);
 }
+
+test('backfill confirms the untaught preflight before starting, and reports when nothing is left', async () => {
+  const h = await setup();
+  try {
+    h.overrides['preflight-backfill'] = async () => ({ propositionCount: 0 });
+    click(h, 'Generate for all untaught…'); await flush();
+    assert.equal(document.querySelector('[role=dialog]'), null);
+    assert.equal(h.app.querySelector('.fc-file-status').textContent, 'All taught propositions already have cards.');
+    h.overrides['preflight-backfill'] = async () => ({ id: 'pf-backfill', propositionCount: 3, chunkCount: 1, estimatedTokens: 50, modelLabel: 'Test model' });
+    click(h, 'Generate for all untaught…'); await flush();
+    const confirmation = document.querySelector('[role=dialog]');
+    assert.equal(confirmation.querySelector('.fc-muted').textContent, '3 propositions (approximately 50 input tokens)');
+    assert.equal(h.calls.filter(([op]) => op === 'start-generation').length, 0);
+    click(h, 'Start', confirmation); await flush();
+    assert.equal(h.calls.find(([op]) => op === 'start-generation')[1].preflightId, 'pf-backfill');
+  } finally { h.dispose(); }
+});

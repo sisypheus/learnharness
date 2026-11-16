@@ -104,10 +104,11 @@ export function activate(ctx) {
     } }, { signal: parentSignal });
     return widget(handle, parentSignal);
   }
-  async function confirmGeneration(propositionIds, signal, showError) {
+  async function confirmGeneration(propositionIds, signal, showError, requestPreflight = () => ctx.call('preflight', { propositionIds: [...propositionIds] }), onEmpty) {
     try {
-      const preflight = await ctx.call('preflight', { propositionIds: [...propositionIds] });
+      const preflight = await requestPreflight();
       if (signal.aborted) return;
+      if (!preflight.propositionCount) { onEmpty?.(); return; }
       const requestId = uuid();
       dialog('Generate flashcards', signal, ({ root, actions, signal: ds, run, close }) => {
         root.append(el('p', 'fc-muted', generationSummary(`${preflight.propositionCount} propositions`, preflight.estimatedTokens)));
@@ -232,16 +233,23 @@ export function activate(ctx) {
     error.setAttribute('role', 'alert');
     const showError = text => { if (!signal.aborted) error.textContent = text; };
     const guarded = action => async () => { try { await action(); } catch (cause) { showError(message(cause)); } };
-    const review = createReviewController({ ctx, signal, button, markdown, onRated: () => { void refresh(); } });
+    // Instant, permanent single-cue deletion from review/practice; read the current revision first.
+    const deleteReviewCue = async cueId => {
+      const { revision } = await ctx.call('get-state');
+      await ctx.call('delete-content', { cueIds: [cueId], revision, requestId: uuid(), deleteEmptyDecks: true });
+      void refresh();
+    };
+    const review = createReviewController({ ctx, signal, button, markdown, onRated: () => { void refresh(); }, onDelete: deleteReviewCue, deleteIcon: trashIcon });
     const practice = scope => review.openPractice(buildPracticeCards(snapshot, scope));
     const pickerSlot = el('div', 'fc-picker'), fileInput = el('input'), fileStatus = el('p', 'fc-muted fc-file-status');
     const canConvertFiles = typeof ctx.documents?.toMarkdown === 'function';
     fileInput.type = 'file'; fileInput.multiple = false; fileInput.hidden = true; fileInput.setAttribute('aria-label', 'Choose a file for flashcards');
     fileStatus.setAttribute('role', 'status');
-    let generationIds = [], generationButton, fileButton, filePreparing = false, cleanupMessage = null;
+    let generationIds = [], generationButton, backfillButton, fileButton, filePreparing = false, cleanupMessage = null;
     function updateGenerationButtons() {
       const busy = filePreparing || !!activeBatch(snapshot?.batch);
       generationButton?.update({ disabled: !generationIds.length || busy });
+      backfillButton?.update({ disabled: busy });
       fileButton?.update({ disabled: !canConvertFiles || busy });
     }
     const picker = widget(ctx.ui.mountKnowledgePicker(pickerSlot, { value: generationIds, onChange: ids => {
@@ -249,6 +257,10 @@ export function activate(ctx) {
     } }, { signal }), signal);
     toolbar.append(pickerSlot);
     generationButton = button(toolbar, 'Generate', () => confirmGeneration(generationIds, signal, showError), signal, { disabled: true, variant: 'default' });
+    backfillButton = button(toolbar, 'Generate for all untaught…', () => {
+      error.textContent = ''; fileStatus.textContent = '';
+      void confirmGeneration([], signal, showError, () => ctx.call('preflight-backfill'), () => { fileStatus.textContent = 'All taught propositions already have cards.'; });
+    }, signal);
     fileButton = button(toolbar, 'Generate from file…', () => fileInput.click(), signal, { disabled: !canConvertFiles, title: canConvertFiles ? undefined : 'Update LearnHarness to generate flashcards from files.' });
     toolbar.append(fileInput);
     const deckPanel = el('section', 'fc-deck-panel'), deckToolbar = el('div', 'fc-deck-toolbar');
@@ -374,6 +386,7 @@ export function activate(ctx) {
         row('relearningSteps', 'Relearning steps (minutes)', settings.relearningSteps.map(value => `${value}m`).join(' '), 'text', parseSteps),
         row('dayStart', 'Day starts at (hour)', settings.dayStart, 'number', Number, { min: 0, max: 23, step: 1 }),
         row('chunkBudget', 'Generation chunk budget (estimated tokens)', settings.chunkBudget, 'number', Number, { min: 1, step: 1 }),
+        row('autoGenerate', 'Auto-generate cards from teaching sessions', settings.autoGenerate, 'toggle', Boolean, { description: 'Uses the cheap model slot; may incur cost.' }),
       ];
     };
     const changeModels = async patch => {

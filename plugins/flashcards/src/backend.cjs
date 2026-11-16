@@ -23,7 +23,7 @@ const reviewConfiguration = s => fingerprint({ retention: s.retention, learningS
 const fail = (message) => { throw new Error(message); };
 function requiredText(value, label) { if (typeof value !== 'string' || !value.trim()) fail(`${label} must not be blank.`); return value; }
 function validateSettings(patch, old) {
-  const allowed = new Set(['retention', 'learningSteps', 'relearningSteps', 'dayStart', 'chunkBudget', 'modelOverride', 'thinkingOverride']);
+  const allowed = new Set(['retention', 'learningSteps', 'relearningSteps', 'dayStart', 'chunkBudget', 'modelOverride', 'thinkingOverride', 'autoGenerate']);
   for (const key of Object.keys(patch)) if (!allowed.has(key)) fail(`Unsupported setting: ${key}`);
   const s = { ...old, ...patch };
   if (s.thinkingOverride === null) delete s.thinkingOverride;
@@ -33,6 +33,7 @@ function validateSettings(patch, old) {
   }
   if (!Number.isInteger(s.dayStart) || s.dayStart < 0 || s.dayStart > 23) fail('Study-day start must be a whole hour from 0 to 23.');
   if (!Number.isSafeInteger(s.chunkBudget) || s.chunkBudget < 1) fail('Input budget must be a positive safe whole number.');
+  if (typeof s.autoGenerate !== 'boolean') fail('Auto-generation must be on or off.');
   if (s.modelOverride !== null && (!s.modelOverride || typeof s.modelOverride.provider !== 'string' || typeof s.modelOverride.id !== 'string')) fail('Invalid model override.');
   if (s.thinkingOverride !== undefined && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(s.thinkingOverride)) fail('Invalid thinking level.');
   return s;
@@ -93,6 +94,15 @@ function pack(graph, ids, state) {
   }
   if (current.length) chunks.push(assemble(current));
   return chunks;
+}
+// Teaching-chat propositions without cards whose generation never succeeded. Applied
+// chunks are never redone. Auto also skips failed attempts (no retry loop while a
+// model is down) and propositions older than autoSince; backfill retries failures.
+function untaught(graph, s, auto = false) {
+  const chunks = s.batches.filter(b => (b.kind ?? 'graph') === 'graph').flatMap(b => b.chunks);
+  const skip = new Set(chunks.filter(c => auto || c.status === 'applied').flatMap(c => c.targetIds ?? []));
+  return graph.propositions.filter(n => Object.hasOwn(graph.sessions ?? {}, n.provenance?.[0]?.chatId ?? '') && !Object.hasOwn(s.propositions, n.id) && !skip.has(n.id)
+    && (!auto || Date.parse(n.createdAt) >= s.settings.autoSince)).map(n => n.id);
 }
 
 function activate(ctx) {
@@ -189,6 +199,7 @@ function activate(ctx) {
       }, 'batch-changed');
       applicationErrors.delete(chunkId);
     } catch (error) { applicationErrors.set(chunkId, `Result could not be saved: ${error.message}`); notify('batch-changed'); }
+    scheduleAuto();
   }
   function watch(batchId, chunkId, taskId) {
     if (observers.has(taskId)) return;
@@ -220,9 +231,37 @@ function activate(ctx) {
       }
     }
   }
+  // Auto-generation: extraction announces completion via activity-changed; debounce
+  // the burst, then queue cards for new teaching-chat propositions.
+  let autoTimer = null, autoBusy = false;
+  function scheduleAuto() {
+    if (disposed || ctx.signal.aborted) return;
+    clearTimeout(autoTimer);
+    autoTimer = setTimeout(() => { void runAuto(); }, 2000);
+    autoTimer.unref?.();
+  }
+  async function runAuto() {
+    if (autoBusy || disposed || ctx.signal.aborted) return;
+    autoBusy = true;
+    try {
+      const s = store.get();
+      if (!s.settings.autoGenerate || activeBatch(s)) return;
+      const ids = untaught(graphNow(), s, true);
+      if (!ids.length) return;
+      const resolved = await resolveModel(s.settings);
+      if (disposed || ctx.signal.aborted || activeBatch(store.get())) return;
+      await startGeneration({ preflightId: planGraph(ids, resolved, 'auto').id, requestId: randomUUID() });
+    } catch (error) {
+      // Nothing is marked handled on failure, so the next trigger retries.
+      if (!disposed && !ctx.signal.aborted) console.info(`[flashcards] auto-generation skipped: ${error.message}`);
+    } finally { autoBusy = false; }
+  }
+  ctx.cleanup(() => clearTimeout(autoTimer));
+  ctx.cleanup(ctx.events.on(event => { if (event.type === 'activity-changed') scheduleAuto(); }));
   ctx.cleanup(ctx.workers.register({ id: 'generate-cues-v1', instructions, resultSchema, validateResult }));
   ctx.cleanup(ctx.workers.register({ id: 'generate-file-facts-v1', instructions: fileGeneration.instructions, resultSchema: fileGeneration.resultSchema, validateResult: fileGeneration.validateResult }));
   reconcile();
+  scheduleAuto();
 
   async function resolveModel(settings) {
     const catalog = await ctx.inference.catalog(); alive();
@@ -237,7 +276,10 @@ function activate(ctx) {
   function register(name, handler) { ctx.handle(name, (input = {}) => { alive(); if (!input || typeof input !== 'object' || Array.isArray(input)) fail('Invalid operation input.'); return handler(input); }); }
   register('get-state', view);
   register('get-catalog', () => ctx.inference.catalog());
-  register('save-settings', patch => { change(s => { s.settings = validateSettings(patch, s.settings); }); return view(); });
+  register('save-settings', patch => {
+    change(s => { const was = s.settings.autoGenerate; s.settings = validateSettings(patch, s.settings); if (!was && s.settings.autoGenerate) s.settings.autoSince = Date.now(); });
+    scheduleAuto(); return view();
+  });
   register('create-deck', ({ name }) => { change(s => s.decks.push({ id: randomUUID(), name: requiredText(name, 'Deck name').trim(), newLimit: 20, propositionIds: [] })); return view(); });
   function createManualCard(input, newTarget) {
     const requestId = requiredText(input.requestId, 'Request ID');
@@ -366,7 +408,15 @@ function activate(ctx) {
   register('preflight', async ({ propositionIds }) => {
     if (!Array.isArray(propositionIds) || propositionIds.some(id => typeof id !== 'string')) fail('Select proposition IDs.');
     if (activeBatch(store.get())) fail('A generation batch is already active.');
-    const resolved = await resolveModel(store.get().settings);
+    return planGraph(propositionIds, await resolveModel(store.get().settings));
+  });
+  register('preflight-backfill', async () => {
+    if (activeBatch(store.get())) fail('A generation batch is already active.');
+    const ids = untaught(graphNow(), store.get());
+    if (!ids.length) return { propositionCount: 0 };
+    return planGraph(ids, await resolveModel(store.get().settings));
+  });
+  function planGraph(propositionIds, resolved, origin) {
     const state = store.get(), chunks = pack(graphNow(), propositionIds, state);
     const plans = chunks.map(input => {
       const tokens = estimate(input);
@@ -375,10 +425,10 @@ function activate(ctx) {
       return { input, prompt: promptFor(input), maxTokens, tokens };
     });
     const id = randomUUID();
-    preflights.set(id, { kind: 'graph', revision: state.revision, settingsHash: fingerprint(state.settings), model: resolved.spec, plans, createdAt: Date.now() });
+    preflights.set(id, { kind: 'graph', ...(origin ? { origin } : {}), revision: state.revision, settingsHash: fingerprint(state.settings), model: resolved.spec, plans, createdAt: Date.now() });
     for (const [key, value] of preflights) if (Date.now() - value.createdAt > 600000) preflights.delete(key);
     return { id, chunkCount: plans.length, propositionCount: new Set(propositionIds).size, estimatedTokens: plans.reduce((n, p) => n + p.tokens, 0), modelLabel: resolved.entry.name };
-  });
+  }
   function rememberFilePlan(file, resolved, state, source, ranges, retryOf) {
     const plans = fileGeneration.prepareFileChunks({ name: file.name, markdown: file.markdown, chunkBudget: state.settings.chunkBudget, entry: resolved.entry, ...(ranges ? { ranges } : {}) });
     const id = randomUUID(), sourceId = source?.id ?? randomUUID(), deckId = source?.deckId ?? randomUUID();
@@ -417,7 +467,8 @@ function activate(ctx) {
     const resolved = await resolveModel(state.settings);
     return rememberFilePlan(file, resolved, state, source, ranges, batch.id);
   });
-  register('start-generation', async ({ preflightId, requestId }) => {
+  register('start-generation', startGeneration);
+  async function startGeneration({ preflightId, requestId }) {
     requiredText(requestId, 'Request ID');
     const previous = store.get().batches.find(b => b.requestId === requestId);
     if (previous) { if (previous.preflightId !== preflightId) fail('This request ID was already used for different work.'); return view(); }
@@ -447,7 +498,7 @@ function activate(ctx) {
           if (newSource) s.decks.push({ id: source.deckId, name: source.deckName, newLimit: source.newLimit, propositionIds: [] });
           else deck(s, source.deckId);
         }
-        s.batches.push({ id: batchId, kind: plan.kind ?? 'graph', requestId, preflightId, status: 'running', cancelRequested: false, createdAt: Date.now(),
+        s.batches.push({ id: batchId, kind: plan.kind ?? 'graph', ...(plan.origin ? { origin: plan.origin } : {}), requestId, preflightId, status: 'running', cancelRequested: false, createdAt: Date.now(),
           ...(plan.kind === 'file' ? { sourceId: plan.sourceId, deckId: plan.deckId, name: plan.file.name } : {}),
           chunks: plan.plans.map(p => ({ id: randomUUID(), requestId: randomUUID(), ...(plan.kind === 'file' ? { start: p.start, end: p.end } : { targetIds: p.input.targets }), status: 'pending', taskId: null, added: 0 })) });
       }, 'batch-changed');
@@ -473,12 +524,12 @@ function activate(ctx) {
       });
     });
     return view();
-  });
+  }
   register('cancel-generation', ({ batchId }) => {
     const b = store.get().batches.find(b => b.id === batchId) ?? fail('Batch not found.');
     change(s => { const current = s.batches.find(x => x.id === b.id); current.cancelRequested = true; current.status = 'cancelling'; for (const c of current.chunks) if (c.status === 'pending') c.status = 'cancelled'; finishBatch(s, current); }, 'batch-changed');
     for (const c of b.chunks) { const t = ctx.workers.list().find(t => t.requestId === c.requestId); if (t && !['succeeded', 'failed', 'cancelled', 'interrupted'].includes(t.status)) ctx.workers.cancel(t.id); }
-    reconcile(); return view();
+    reconcile(); scheduleAuto(); return view();
   });
   register('resume-results', () => { reconcile(); return view(); });
 
